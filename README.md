@@ -8,5 +8,10 @@ ZRecorder is still in the very alpha stage, you may face
 instabilities, wrong aspect ratios, inaccurate quality and
 app crashes.
 
-# License
-This project is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0). See the LICENSE file for details.
+## License
+
+This project is licensed under the MIT License.
+
+If you use or redistribute this project, please keep the original copyright
+notice and license. Credit to the original project and author (chappcG) is
+appreciated.

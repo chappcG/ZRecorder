@@ -34,6 +34,9 @@ import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.chap.zrec.MainActivity
 import com.chap.zrec.R
+import kotlinx.coroutines.*
+import java.io.File
+import java.io.FileInputStream
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -69,6 +72,8 @@ class RecorderService : Service() {
     }
 
     private val handler = Handler(Looper.getMainLooper())
+    private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     
@@ -79,11 +84,14 @@ class RecorderService : Service() {
     private var outputFd: ParcelFileDescriptor? = null
     private var outputUri: Uri? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var tempFile: File? = null
+    private var ffmpegProcessor: FFmpegProcessor? = null
 
     private var isRecording = false
     private var isPaused = false
     private var isStopping = false
     private var isCountingDown = false
+    private var isProcessing = false
 
     private var startedAt = 0L
     private var pausedAt = 0L
@@ -148,6 +156,7 @@ class RecorderService : Service() {
         Log.d("ZRecorder", "RecorderService onCreate")
         createChannel()
         RecorderState.setInactive()
+        ffmpegProcessor = FFmpegProcessor(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -221,8 +230,24 @@ class RecorderService : Service() {
             outHeight = if (isPortrait) long else short
             Log.d("ZRecorder", "Output size: ${outWidth}x${outHeight}, isPortrait=$isPortrait, fps=$fps, bitrate=$videoBitrate")
 
-            createOutput()
-            muxer = MediaMuxer(outputFd?.fileDescriptor ?: throw IOException("No fd"), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            // Create temp file for initial recording
+            tempFile = File(cacheDir, "zrec_temp_${System.currentTimeMillis()}.mp4")
+            
+            // Create MediaStore entry for final output
+            val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+            val safePrefix = filePrefix.trim().ifEmpty { "ZREC" }.replace(Regex("[^A-Za-z0-9_-]"), "_")
+            val displayName = "${safePrefix}_$timestamp.mp4"
+            val values = ContentValues().apply { 
+                put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
+                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MOVIES}/ZRecorder")
+                put(MediaStore.Video.Media.IS_PENDING, 1) 
+            }
+            val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values) ?: throw IOException("Cannot create file")
+            outputUri = uri
+            outputFd = contentResolver.openFileDescriptor(uri, "w") ?: throw IOException("Cannot open file")
+            
+            muxer = MediaMuxer(outputFd!!.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
 
             val mimeType = if (videoEncoderName == "H.265" && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                 MediaFormat.MIMETYPE_VIDEO_HEVC
@@ -234,11 +259,7 @@ class RecorderService : Service() {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
                 setInteger(MediaFormat.KEY_BIT_RATE, videoBitrate)
                 setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, fps) // Keyframe every second
-                setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
-                setInteger(MediaFormat.KEY_PROFILE, if (mimeType == MediaFormat.MIMETYPE_VIDEO_HEVC) 
-                    MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10 else 
-                    MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, fps)
             }
             
             videoEncoder = MediaCodec.createEncoderByType(mimeType).apply {
@@ -271,7 +292,6 @@ class RecorderService : Service() {
 
                     val audioMediaFormat = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, 1).apply {
                         setInteger(MediaFormat.KEY_BIT_RATE, audioBitrate)
-                        setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
                     }
                     audioEncoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC).apply {
                         configure(audioMediaFormat, null, null, 0)
@@ -336,11 +356,9 @@ class RecorderService : Service() {
             if (status >= 0) {
                 if (!muxerStarted) {
                     videoTrackIndex = muxer!!.addTrack(videoEncoder!!.getOutputFormat(status))
-                    Log.d("ZRecorder", "Video track added: ${videoEncoder!!.getOutputFormat(status)}")
                     if (audioEncoder == null) {
                         muxer!!.start()
                         muxerStarted = true
-                        Log.d("ZRecorder", "Muxer started (video only)")
                     }
                 }
                 if (muxerStarted && bufferInfo.size > 0) {
@@ -375,11 +393,9 @@ class RecorderService : Service() {
                 if (outputBufferIndex >= 0) {
                     if (!muxerStarted) {
                         audioTrackIndex = muxer!!.addTrack(encoder.getOutputFormat(outputBufferIndex))
-                        Log.d("ZRecorder", "Audio track added: ${encoder.getOutputFormat(outputBufferIndex)}")
                         if (videoTrackIndex >= 0) {
                             muxer!!.start()
                             muxerStarted = true
-                            Log.d("ZRecorder", "Muxer started (video + audio)")
                         }
                     }
                     if (muxerStarted && bufferInfo.size > 0) {
@@ -452,37 +468,6 @@ class RecorderService : Service() {
         stopSelf()
     }
 
-    override fun onDestroy() {
-        Log.d("ZRecorder", "onDestroy")
-        isRunning.set(false)
-        handler.removeCallbacks(countdownRunnable)
-        RecorderState.setInactive()
-        releaseAll()
-        mediaProjection?.let { 
-            runCatching { it.unregisterCallback(projectionCallback) }
-            runCatching { it.stop() } 
-        }
-        mediaProjection = null
-        releaseWakeLock()
-        MediaProjectionCache.clear()
-        super.onDestroy()
-    }
-
-    private fun createOutput() {
-        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val safePrefix = filePrefix.trim().ifEmpty { "ZREC" }.replace(Regex("[^A-Za-z0-9_-]"), "_")
-        val displayName = "${safePrefix}_$timestamp.mp4"
-        val values = ContentValues().apply { 
-            put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
-            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-            put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MOVIES}/ZRecorder")
-            put(MediaStore.Video.Media.IS_PENDING, 1) 
-        }
-        val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values) ?: throw IOException("Cannot create file")
-        val fd = contentResolver.openFileDescriptor(uri, "w") ?: throw IOException("Cannot open file")
-        outputUri = uri; outputFd = fd
-    }
-
     private fun finalizeOutput() {
         try {
             if (muxerStarted) muxer?.stop()
@@ -490,18 +475,84 @@ class RecorderService : Service() {
         runCatching { muxer?.release() }
         runCatching { outputFd?.close() }
         
-        val uri = outputUri
-        if (uri != null) { 
-            val values = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
-            runCatching { contentResolver.update(uri, values, null, null) } 
+        outputFd = null
+        
+        // Start FFmpeg processing in background
+        serviceScope.launch {
+            isProcessing = true
+            showNotification("Z Recorder", "Processing video with FFmpeg...")
+            
+            val temp = tempFile
+            val uri = outputUri
+            
+            if (temp != null && temp.exists() && uri != null && ffmpegProcessor != null) {
+                try {
+                    val videoCodec = if (videoEncoderName == "H.265") "libx265" else "libx264"
+                    
+                    val config = FFmpegProcessor.EncodeConfig(
+                        inputPath = temp.absolutePath,
+                        outputPath = temp.absolutePath.replace(".mp4", "_final.mp4"),
+                        videoCodec = videoCodec,
+                        videoBitrate = videoBitrate / 1000, // Convert to kbps
+                        audioCodec = "aac",
+                        audioBitrate = audioBitrate / 1000,
+                        fps = fps,
+                        width = outWidth,
+                        height = outHeight,
+                        preset = "medium"
+                    )
+                    
+                    val success = ffmpegProcessor!!.encode(config)
+                    
+                    if (success) {
+                        // Copy final file to MediaStore
+                        val finalFile = File(config.outputPath)
+                        if (finalFile.exists()) {
+                            contentResolver.openOutputStream(uri)?.use { out ->
+                                FileInputStream(finalFile).use { inp ->
+                                    inp.copyTo(out)
+                                }
+                            }
+                            finalFile.delete()
+                        }
+                    }
+                    
+                    temp.delete()
+                    
+                } catch (e: Exception) {
+                    Log.e("ZRecorder", "FFmpeg processing failed: ${e.message}", e)
+                    // Fallback: copy temp file as-is
+                    try {
+                        contentResolver.openOutputStream(uri)?.use { out ->
+                            FileInputStream(temp).use { inp ->
+                                inp.copyTo(out)
+                            }
+                        }
+                    } catch (e2: Exception) {
+                        Log.e("ZRecorder", "Fallback copy failed: ${e2.message}")
+                    }
+                    temp.delete()
+                }
+            }
+            
+            // Finalize MediaStore entry
+            if (uri != null) { 
+                val values = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
+                runCatching { contentResolver.update(uri, values, null, null) } 
+            }
+            
+            isProcessing = false
+            outputUri = null
+            tempFile = null
+            
+            stopSelf()
         }
-        outputFd = null; outputUri = null; muxer = null
     }
 
     private fun cleanupFailedOutput() {
-        runCatching { outputFd?.close() }
+        tempFile?.delete()
         outputUri?.let { runCatching { contentResolver.delete(it, null, null) } }
-        outputFd = null; outputUri = null; muxer = null
+        outputFd = null; outputUri = null; tempFile = null
     }
 
     private fun releaseAll() { 

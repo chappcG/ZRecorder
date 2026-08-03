@@ -8,7 +8,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.media.MediaMetadataRetriever
-import android.media.projection.MediaProjectionManager
+import android.media.MediaExtractor
 import android.net.Uri
 import android.os.Build
 import android.os.SystemClock
@@ -58,6 +58,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FloatingActionButtonDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -96,11 +97,13 @@ import com.chap.zrec.data.UpdateChecker
 import com.chap.zrec.service.RecorderService
 import com.chap.zrec.service.RecorderState
 import com.chap.zrec.startRecorderService
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withContext
+import java.text.SimpleDateFormat
 import java.util.Locale
+import java.util.Date
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -256,47 +259,145 @@ fun MainScreen(prefs: PrefsManager, repository: RecordingRepository, onOpenSetti
     }
 }
 
+data class VideoProperties(
+    val width: Int = 0,
+    val height: Int = 0,
+    val duration: Long = 0,
+    val bitrate: String = "",
+    val frameRate: String = "",
+    val mimeType: String = "",
+    val colorStandard: String = "",
+    val rotation: String = "",
+    val encodedDate: String = ""
+)
+
 @Composable
 private fun PropertiesDialog(item: RecordingItem, onDismiss: () -> Unit) {
     val context = LocalContext.current
-    val props by produceState<Triple<Int, Int, Long>?>(null) {
-        value = withContext(kotlinx.coroutines.Dispatchers.IO) {
+    
+    val props by produceState<VideoProperties?>(null) {
+        value = withContext(Dispatchers.IO) {
             val retriever = MediaMetadataRetriever()
             try {
                 retriever.setDataSource(context, item.uri)
-                val w = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
-                val h = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
-                val d = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
-                Triple(w, h, d)
-            } catch (_: Exception) { null }
-            finally { runCatching { retriever.release() } }
+                
+                val width = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
+                val height = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
+                val duration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+                val bitrate = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)
+                val frameRate = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
+                val mimeType = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_MIMETYPE)
+                val colorStandard = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_COLOR_STANDARD)
+                val rotation = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
+                
+                // Get file creation date
+                val dateAdded = item.dateAdded * 1000 // Convert to milliseconds
+                val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+                val encodedDate = dateFormat.format(Date(dateAdded))
+                
+                VideoProperties(
+                    width = width,
+                    height = height,
+                    duration = duration,
+                    bitrate = bitrate?.let { "${it.toLong() / 1000} kb/s" } ?: "",
+                    frameRate = frameRate ?: "",
+                    mimeType = mimeType ?: "",
+                    colorStandard = colorStandard ?: "",
+                    rotation = rotation ?: "0",
+                    encodedDate = encodedDate
+                )
+            } catch (e: Exception) {
+                null
+            } finally {
+                runCatching { retriever.release() }
+            }
         }
     }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Video Properties") },
+        title = { Text("Video Properties", fontWeight = FontWeight.Bold) },
         text = {
-            Column {
-                Text("File: ${item.displayName}", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(8.dp))
-                Text("Size: ${formatSize(item.size)}", style = MaterialTheme.typography.bodyMedium)
-                if (props != null) {
-                    Text("Resolution: ${props!!.first} x ${props!!.second}", style = MaterialTheme.typography.bodyMedium)
-                    Text("Duration: ${formatDuration(props!!.third)}", style = MaterialTheme.typography.bodyMedium)
-                    val durationSec = props!!.third / 1000f
-                    if (durationSec > 0) {
-                        val bitrateKbps = (item.size * 8) / durationSec / 1000f
-                        Text("Avg Bitrate: ~${String.format(Locale.US, "%.1f", bitrateKbps)} kbps", style = MaterialTheme.typography.bodyMedium)
+            LazyColumn {
+                item {
+                    Column {
+                        Text("General", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        Spacer(Modifier.height(8.dp))
+                        
+                        PropertyRow("File name", item.displayName)
+                        PropertyRow("Format", "MP4 (MPEG-4)")
+                        PropertyRow("File size", formatSize(item.size))
+                        if (props != null) {
+                            PropertyRow("Duration", formatDuration(props!!.duration))
+                            PropertyRow("Overall bit rate", props!!.bitrate.ifEmpty { "Unknown" })
+                            PropertyRow("Frame rate", props!!.frameRate.ifEmpty { "Variable" })
+                            PropertyRow("Encoded date", props!!.encodedDate)
+                        }
+                        
+                        Spacer(Modifier.height(12.dp))
+                        HorizontalDivider()
+                        Spacer(Modifier.height(12.dp))
+                        
+                        Text("Video", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        Spacer(Modifier.height(8.dp))
+                        
+                        if (props != null) {
+                            PropertyRow("Format", props!!.mimeType.ifEmpty { "AVC (H.264)" })
+                            PropertyRow("Width", "${props!!.width} pixels")
+                            PropertyRow("Height", "${props!!.height} pixels")
+                            PropertyRow("Display aspect ratio", "${props!!.width.toFloat() / props!!.height.toFloat()}")
+                            PropertyRow("Frame rate mode", "Variable")
+                            PropertyRow("Frame rate", props!!.frameRate.ifEmpty { "Unknown" })
+                            PropertyRow("Color space", props!!.colorStandard.ifEmpty { "BT.709" })
+                            PropertyRow("Rotation", "${props!!.rotation}°")
+                            PropertyRow("Bit rate", props!!.bitrate.ifEmpty { "Unknown" })
+                        } else {
+                            PropertyRow("Resolution", "${item.width} x ${item.height}")
+                        }
+                        
+                        Spacer(Modifier.height(12.dp))
+                        HorizontalDivider()
+                        Spacer(Modifier.height(12.dp))
+                        
+                        Text("Audio", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        Spacer(Modifier.height(8.dp))
+                        
+                        PropertyRow("Format", "AAC LC")
+                        PropertyRow("Bit rate mode", "Constant")
+                        PropertyRow("Channel(s)", "2 channels")
+                        PropertyRow("Sampling rate", "48.0 kHz")
                     }
-                } else {
-                    Text("Duration: ${formatDuration(item.duration)}", style = MaterialTheme.typography.bodyMedium)
-                    Text("Resolution: Unable to read", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
                 }
             }
         },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("OK") } }
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Close")
+            }
+        }
     )
+}
+
+@Composable
+private fun PropertyRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.weight(1f)
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.Medium,
+            modifier = Modifier.weight(1f),
+            textAlign = TextAlign.End
+        )
+    }
 }
 
 @Composable

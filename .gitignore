@@ -9,7 +9,7 @@ local.properties
 .DS_Store
 captures/
 .acside/
-exec.sh
+/exec.sh
 *.jks
 *.keystore
 keystore.properties

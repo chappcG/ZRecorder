@@ -94,6 +94,8 @@ import com.chap.zrec.data.PrefsManager
 import com.chap.zrec.data.RecorderSettings
 import com.chap.zrec.data.RecordingItem
 import com.chap.zrec.data.RecordingRepository
+import android.provider.MediaStore
+import com.chap.zrec.service.FFmpegProcessor
 import com.chap.zrec.data.UpdateChecker
 import com.chap.zrec.service.RecorderService
 import com.chap.zrec.service.RecorderState
@@ -260,145 +262,138 @@ fun MainScreen(prefs: PrefsManager, repository: RecordingRepository, onOpenSetti
     }
 }
 
-data class VideoProperties(
-    val width: Int = 0,
-    val height: Int = 0,
-    val duration: Long = 0,
-    val bitrate: String = "",
-    val frameRate: String = "",
-    val mimeType: String = "",
-    val colorStandard: String = "",
-    val rotation: String = "",
-    val encodedDate: String = ""
-)
-
 @Composable
 private fun PropertiesDialog(item: RecordingItem, onDismiss: () -> Unit) {
     val context = LocalContext.current
-    
-    val props by produceState<VideoProperties?>(null) {
-        value = withContext(Dispatchers.IO) {
-            val retriever = MediaMetadataRetriever()
-            try {
-                retriever.setDataSource(context, item.uri)
-                
-                val width = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
-                val height = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
-                val duration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
-                val bitrate = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)
-                val frameRate = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
-                val mimeType = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_MIMETYPE)
-                val colorStandard = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_COLOR_STANDARD)
-                val rotation = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
-                
-                // Get file creation date
-                val dateAdded = item.dateAdded * 1000 // Convert to milliseconds
-                val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
-                val encodedDate = dateFormat.format(Date(dateAdded))
-                
-                VideoProperties(
-                    width = width,
-                    height = height,
-                    duration = duration,
-                    bitrate = bitrate?.let { "${it.toLong() / 1000} kb/s" } ?: "",
-                    frameRate = frameRate ?: "",
-                    mimeType = mimeType ?: "",
-                    colorStandard = colorStandard ?: "",
-                    rotation = rotation ?: "0",
-                    encodedDate = encodedDate
-                )
-            } catch (e: Exception) {
-                null
-            } finally {
-                runCatching { retriever.release() }
+
+    val json by produceState<org.json.JSONObject?>(null) {
+        value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            var path: String? = null
+            var copied = false
+            // Try direct path first
+            context.contentResolver.query(
+                item.uri, arrayOf(MediaStore.Video.Media.DATA), null, null, null
+            )?.use { c ->
+                if (c.moveToFirst()) {
+                    val p = c.getString(0)
+                    if (p != null && java.io.File(p).exists()) path = p
+                }
             }
+            // Fallback: copy to cache
+            if (path == null) {
+                val tmp = java.io.File(context.cacheDir, "probe_${'$'}{System.currentTimeMillis()}.mp4")
+                try {
+                    context.contentResolver.openInputStream(item.uri)?.use { i ->
+                        tmp.outputStream().use { i.copyTo(it) }
+                    }
+                    path = tmp.absolutePath
+                    copied = true
+                } catch (_: Exception) {}
+            }
+            val result = path?.let { FFmpegProcessor.probe(it) }
+            if (copied) java.io.File(path!!).delete()
+            result
         }
     }
+
+    val rows = remember(json) { buildPropertyRows(item, json) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Video Properties", fontWeight = FontWeight.Bold) },
         text = {
             LazyColumn {
-                item {
-                    Column {
-                        Text("General", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                        Spacer(Modifier.height(8.dp))
-                        
-                        PropertyRow("File name", item.displayName)
-                        PropertyRow("Format", "MP4 (MPEG-4)")
-                        PropertyRow("File size", formatSize(item.size))
-                        if (props != null) {
-                            PropertyRow("Duration", formatDuration(props!!.duration))
-                            PropertyRow("Overall bit rate", props!!.bitrate.ifEmpty { "Unknown" })
-                            PropertyRow("Frame rate", props!!.frameRate.ifEmpty { "Variable" })
-                            PropertyRow("Encoded date", props!!.encodedDate)
+                items(rows) { (section, label, value) ->
+                    if (label.isEmpty()) {
+                        Text(section, style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 12.dp, bottom = 6.dp))
+                    } else {
+                        Row(modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text(label, style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
+                            Text(value, style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f),
+                                textAlign = TextAlign.End)
                         }
-                        
-                        Spacer(Modifier.height(12.dp))
-                        HorizontalDivider()
-                        Spacer(Modifier.height(12.dp))
-                        
-                        Text("Video", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                        Spacer(Modifier.height(8.dp))
-                        
-                        if (props != null) {
-                            PropertyRow("Format", props!!.mimeType.ifEmpty { "AVC (H.264)" })
-                            PropertyRow("Width", "${props!!.width} pixels")
-                            PropertyRow("Height", "${props!!.height} pixels")
-                            PropertyRow("Display aspect ratio", "${props!!.width.toFloat() / props!!.height.toFloat()}")
-                            PropertyRow("Frame rate mode", "Variable")
-                            PropertyRow("Frame rate", props!!.frameRate.ifEmpty { "Unknown" })
-                            PropertyRow("Color space", props!!.colorStandard.ifEmpty { "BT.709" })
-                            PropertyRow("Rotation", "${props!!.rotation}°")
-                            PropertyRow("Bit rate", props!!.bitrate.ifEmpty { "Unknown" })
-                        } else {
-                            PropertyRow("Resolution", "${item.width} x ${item.height}")
-                        }
-                        
-                        Spacer(Modifier.height(12.dp))
-                        HorizontalDivider()
-                        Spacer(Modifier.height(12.dp))
-                        
-                        Text("Audio", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                        Spacer(Modifier.height(8.dp))
-                        
-                        PropertyRow("Format", "AAC LC")
-                        PropertyRow("Bit rate mode", "Constant")
-                        PropertyRow("Channel(s)", "2 channels")
-                        PropertyRow("Sampling rate", "48.0 kHz")
                     }
                 }
             }
         },
-        confirmButton = {
-            TextButton(onClick = onDismiss) {
-                Text("Close")
-            }
-        }
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } }
     )
 }
 
-@Composable
-private fun PropertyRow(label: String, value: String) {
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.weight(1f)
-        )
-        Text(
-            text = value,
-            style = MaterialTheme.typography.bodyMedium,
-            fontWeight = FontWeight.Medium,
-            modifier = Modifier.weight(1f),
-            textAlign = TextAlign.End
-        )
+private fun buildPropertyRows(item: RecordingItem, json: org.json.JSONObject?): List<Triple<String, String, String>> {
+    val rows = mutableListOf<Triple<String, String, String>>()
+    rows += Triple("General", "", "")
+    rows += Triple("", "File name", item.displayName)
+    rows += Triple("", "File size", formatSize(item.size))
+
+    if (json == null) {
+        rows += Triple("", "Resolution", "${'$'}{item.width}x${'$'}{item.height}")
+        rows += Triple("", "Duration", formatDuration(item.duration))
+        rows += Triple("", "Note", "Probe unavailable")
+        return rows
     }
+
+    val format = json.optJSONObject("format")
+    val streams = json.optJSONArray("streams")
+    var video: org.json.JSONObject? = null
+    var audio: org.json.JSONObject? = null
+    if (streams != null) {
+        for (i in 0 until streams.length()) {
+            val s = streams.optJSONObject(i) ?: continue
+            if (video == null && s.optString("codec_type") == "video") video = s
+            else if (audio == null && s.optString("codec_type") == "audio") audio = s
+        }
+    }
+
+    format?.let { f ->
+        rows += Triple("", "Format", (f.optString("format_long_name", f.optString("format_name", "MP4"))))
+        rows += Triple("", "Duration", formatDuration((f.optDouble("duration", 0.0) * 1000).toLong()))
+        rows += Triple("", "Overall bit rate", bitrateText(f.optLong("bit_rate", 0)))
+    }
+
+    video?.let { v ->
+        rows += Triple("Video", "", "")
+        rows += Triple("", "Codec", codecLabel(v.optString("codec_name", "")))
+        rows += Triple("", "Width", "${'$'}{v.optInt("width")} pixels")
+        rows += Triple("", "Height", "${'$'}{v.optInt("height")} pixels")
+        rows += Triple("", "Frame rate", fpsText(v.optString("avg_frame_rate", v.optString("r_frame_rate", ""))))
+        rows += Triple("", "Bit rate", bitrateText(v.optLong("bit_rate", 0)))
+    }
+
+    audio?.let { a ->
+        rows += Triple("Audio", "", "")
+        rows += Triple("", "Codec", a.optString("codec_name", "aac").uppercase())
+        rows += Triple("", "Sampling rate", "${'$'}{a.optString("sample_rate", "?")} Hz")
+        rows += Triple("", "Channel(s)", a.optString("channels", "?"))
+        rows += Triple("", "Bit rate", bitrateText(a.optLong("bit_rate", 0)))
+    }
+    return rows
+}
+
+private fun codecLabel(name: String): String = when (name) {
+    "h264" -> "H.264 (AVC)"
+    "hevc" -> "H.265 (HEVC)"
+    else -> name.uppercase()
+}
+
+private fun fpsText(frac: String): String {
+    if (frac.isBlank()) return "Unknown"
+    return if (frac.contains("/")) {
+        val p = frac.split("/")
+        val n = p[0].toDoubleOrNull() ?: return "Unknown"
+        val d = p.getOrNull(1)?.toDoubleOrNull() ?: 0.0
+        if (d > 0) "${'$'}{(n / d).toInt()} fps" else "Unknown"
+    } else "${'$'}{frac.toDoubleOrNull()?.toInt() ?: 0} fps"
+}
+
+private fun bitrateText(bits: Long): String = when {
+    bits <= 0 -> "Unknown"
+    bits >= 1_000_000 -> String.format(java.util.Locale.US, "%.2f Mb/s", bits / 1_000_000.0)
+    else -> "${'$'}{bits / 1000} kb/s"
 }
 
 @Composable

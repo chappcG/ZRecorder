@@ -26,15 +26,16 @@ import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Log
-import android.view.Surface
-import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.chap.zrec.MainActivity
 import com.chap.zrec.R
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import java.io.File
 import java.io.FileInputStream
 import java.io.IOException
@@ -72,11 +73,10 @@ class RecorderService : Service() {
     }
 
     private val handler = Handler(Looper.getMainLooper())
-    private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
-    
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
-    
     private var videoEncoder: MediaCodec? = null
     private var audioEncoder: MediaCodec? = null
     private var audioRecord: AudioRecord? = null
@@ -85,13 +85,11 @@ class RecorderService : Service() {
     private var outputUri: Uri? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var tempFile: File? = null
-    private var ffmpegProcessor: FFmpegProcessor? = null
 
     private var isRecording = false
     private var isPaused = false
     private var isStopping = false
     private var isCountingDown = false
-    private var isProcessing = false
 
     private var startedAt = 0L
     private var pausedAt = 0L
@@ -119,7 +117,6 @@ class RecorderService : Service() {
     private var videoTrackIndex = -1
     private var audioTrackIndex = -1
     private var muxerStarted = false
-    
     private var audioBufferSize = 4096
 
     private val isRunning = AtomicBoolean(false)
@@ -127,10 +124,7 @@ class RecorderService : Service() {
     private var audioThread: Thread? = null
 
     private val projectionCallback = object : MediaProjection.Callback() {
-        override fun onStop() { 
-            Log.d("ZRecorder", "MediaProjection onStop")
-            handler.post { stopRecording(fromProjection = true) } 
-        }
+        override fun onStop() { handler.post { stopRecording(fromProjection = true) } }
     }
 
     private val countdownRunnable = object : Runnable {
@@ -150,17 +144,14 @@ class RecorderService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
-    
+
     override fun onCreate() {
         super.onCreate()
-        Log.d("ZRecorder", "RecorderService onCreate")
         createChannel()
         RecorderState.setInactive()
-        ffmpegProcessor = FFmpegProcessor(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Log.d("ZRecorder", "onStartCommand: ${intent?.action}")
         when (intent?.action) {
             ACTION_START -> {
                 if (isRecording || isCountingDown) return START_NOT_STICKY
@@ -176,7 +167,6 @@ class RecorderService : Service() {
 
                 resultCode = cachedResultCode
                 resultData = cachedData
-
                 width = intent.getIntExtra(EXTRA_WIDTH, 1280)
                 height = intent.getIntExtra(EXTRA_HEIGHT, 720)
                 fps = intent.getIntExtra(EXTRA_FPS, 30)
@@ -209,7 +199,6 @@ class RecorderService : Service() {
     }
 
     private fun startRecording() {
-        Log.d("ZRecorder", "startRecording")
         if (isRecording || isStopping) return
         val data = resultData ?: run { stopRecording(); return }
 
@@ -228,40 +217,38 @@ class RecorderService : Service() {
             }
             outWidth = if (isPortrait) short else long
             outHeight = if (isPortrait) long else short
-            Log.d("ZRecorder", "Output size: ${outWidth}x${outHeight}, isPortrait=$isPortrait, fps=$fps, bitrate=$videoBitrate")
 
-            // Create temp file for initial recording
+            // FIX: Record to TEMP file first. FFmpeg will produce the final file.
             tempFile = File(cacheDir, "zrec_temp_${System.currentTimeMillis()}.mp4")
-            
-            // Create MediaStore entry for final output
+            outputFd = ParcelFileDescriptor.open(
+                tempFile!!,
+                ParcelFileDescriptor.MODE_WRITE_ONLY or
+                    ParcelFileDescriptor.MODE_CREATE or
+                    ParcelFileDescriptor.MODE_TRUNCATE
+            )
+
             val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
             val safePrefix = filePrefix.trim().ifEmpty { "ZREC" }.replace(Regex("[^A-Za-z0-9_-]"), "_")
-            val displayName = "${safePrefix}_$timestamp.mp4"
-            val values = ContentValues().apply { 
-                put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
+            val values = ContentValues().apply {
+                put(MediaStore.Video.Media.DISPLAY_NAME, "${safePrefix}_$timestamp.mp4")
                 put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
                 put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MOVIES}/ZRecorder")
-                put(MediaStore.Video.Media.IS_PENDING, 1) 
+                put(MediaStore.Video.Media.IS_PENDING, 1)
             }
-            val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values) ?: throw IOException("Cannot create file")
-            outputUri = uri
-            outputFd = contentResolver.openFileDescriptor(uri, "w") ?: throw IOException("Cannot open file")
-            
+            outputUri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+                ?: throw IOException("Cannot create file")
+
             muxer = MediaMuxer(outputFd!!.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
 
-            val mimeType = if (videoEncoderName == "H.265" && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                MediaFormat.MIMETYPE_VIDEO_HEVC
-            } else {
-                MediaFormat.MIMETYPE_VIDEO_AVC
-            }
-            
+            val mimeType = if (videoEncoderName == "H.265" && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N)
+                MediaFormat.MIMETYPE_VIDEO_HEVC else MediaFormat.MIMETYPE_VIDEO_AVC
+
             val videoFormat = MediaFormat.createVideoFormat(mimeType, outWidth, outHeight).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-                setInteger(MediaFormat.KEY_BIT_RATE, videoBitrate)
+                setInteger(MediaFormat.KEY_BIT_RATE, maxOf(videoBitrate, 20_000_000)) // high quality first pass
                 setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, fps)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             }
-            
             videoEncoder = MediaCodec.createEncoderByType(mimeType).apply {
                 configure(videoFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             }
@@ -274,11 +261,11 @@ class RecorderService : Service() {
                     val audioFormat = AudioFormat.ENCODING_PCM_16BIT
                     audioBufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat).coerceAtLeast(4096)
 
-                    audioRecord = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && (audioMode == "Internal Audio" || audioMode == "Internal + Microphone")) {
-                        Log.d("ZRecorder", "Using AudioPlaybackCapture for Internal Audio")
+                    audioRecord = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+                        (audioMode == "Internal Audio" || audioMode == "Internal + Microphone")) {
                         val config = AudioPlaybackCaptureConfiguration.Builder(projection)
-                            .addMatchingUsage(android.media.AudioAttributes.USAGE_MEDIA)
-                            .addMatchingUsage(android.media.AudioAttributes.USAGE_GAME)
+                            .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                            .addMatchingUsage(AudioAttributes.USAGE_GAME)
                             .build()
                         AudioRecord.Builder()
                             .setAudioPlaybackCaptureConfig(config)
@@ -286,7 +273,6 @@ class RecorderService : Service() {
                             .setBufferSizeInBytes(audioBufferSize)
                             .build()
                     } else {
-                        Log.d("ZRecorder", "Using Microphone")
                         AudioRecord(MediaRecorder.AudioSource.MIC, sampleRate, channelConfig, audioFormat, audioBufferSize)
                     }
 
@@ -296,9 +282,8 @@ class RecorderService : Service() {
                     audioEncoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC).apply {
                         configure(audioMediaFormat, null, null, 0)
                     }
-                    Log.d("ZRecorder", "Audio encoder initialized successfully")
                 } catch (e: Exception) {
-                    Log.e("ZRecorder", "Failed to initialize audio recording, falling back to video only: ${e.message}")
+                    Log.e("ZRecorder", "Audio init failed: ${e.message}")
                     audioRecord = null
                     audioEncoder = null
                 }
@@ -315,7 +300,6 @@ class RecorderService : Service() {
 
             isRunning.set(true)
             muxerStarted = false
-
             videoThread = Thread { drainVideo() }.apply { start() }
             if (audioEncoder != null && audioRecord != null) {
                 audioThread = Thread { drainAudio() }.apply { start() }
@@ -327,17 +311,12 @@ class RecorderService : Service() {
             accumulatedPause = 0L
             pausedAt = 0L
             RecorderState.setActive(startedAt)
-            
-            Log.d("ZRecorder", "Recording started successfully!")
-            showNotification("Z Recorder", "Recording", chronometer = true, whenMillis = SystemClock.elapsedRealtime() - elapsedMillis())
+            showNotification("Z Recorder", "Recording", chronometer = true, whenMillis = SystemClock.elapsedRealtime())
         } catch (e: Exception) {
-            Log.e("ZRecorder", "Exception in startRecording: ${e.message}", e)
+            Log.e("ZRecorder", "startRecording failed: ${e.message}", e)
             cleanupFailedOutput()
             releaseAll()
-            mediaProjection?.let { 
-                runCatching { it.unregisterCallback(projectionCallback) }
-                runCatching { it.stop() } 
-            }
+            mediaProjection?.let { runCatching { it.unregisterCallback(projectionCallback) }; runCatching { it.stop() } }
             mediaProjection = null
             RecorderState.setInactive()
             releaseWakeLock()
@@ -351,15 +330,11 @@ class RecorderService : Service() {
         var sawEOS = false
         while (isRunning.get() && !sawEOS) {
             if (isPaused) { Thread.sleep(50); continue }
-            
             val status = videoEncoder!!.dequeueOutputBuffer(bufferInfo, 10000)
             if (status >= 0) {
                 if (!muxerStarted) {
                     videoTrackIndex = muxer!!.addTrack(videoEncoder!!.getOutputFormat(status))
-                    if (audioEncoder == null) {
-                        muxer!!.start()
-                        muxerStarted = true
-                    }
+                    if (audioEncoder == null) { muxer!!.start(); muxerStarted = true }
                 }
                 if (muxerStarted && bufferInfo.size > 0) {
                     muxer?.writeSampleData(videoTrackIndex, videoEncoder!!.getOutputBuffer(status)!!, bufferInfo)
@@ -379,30 +354,24 @@ class RecorderService : Service() {
 
         while (isRunning.get() && !sawEOS) {
             if (isPaused) { Thread.sleep(50); continue }
-
             val read = recorder.read(buffer, 0, audioBufferSize)
             if (read > 0) {
-                val inputBufferIndex = encoder.dequeueInputBuffer(10000)
-                if (inputBufferIndex >= 0) {
-                    val inputBuffer = encoder.getInputBuffer(inputBufferIndex)
-                    inputBuffer?.put(buffer, 0, read)
-                    encoder.queueInputBuffer(inputBufferIndex, 0, read, System.nanoTime() / 1000, 0)
+                val inIdx = encoder.dequeueInputBuffer(10000)
+                if (inIdx >= 0) {
+                    encoder.getInputBuffer(inIdx)?.put(buffer, 0, read)
+                    encoder.queueInputBuffer(inIdx, 0, read, System.nanoTime() / 1000, 0)
                 }
-
-                val outputBufferIndex = encoder.dequeueOutputBuffer(bufferInfo, 10000)
-                if (outputBufferIndex >= 0) {
+                val outIdx = encoder.dequeueOutputBuffer(bufferInfo, 10000)
+                if (outIdx >= 0) {
                     if (!muxerStarted) {
-                        audioTrackIndex = muxer!!.addTrack(encoder.getOutputFormat(outputBufferIndex))
-                        if (videoTrackIndex >= 0) {
-                            muxer!!.start()
-                            muxerStarted = true
-                        }
+                        audioTrackIndex = muxer!!.addTrack(encoder.getOutputFormat(outIdx))
+                        if (videoTrackIndex >= 0) { muxer!!.start(); muxerStarted = true }
                     }
                     if (muxerStarted && bufferInfo.size > 0) {
-                        muxer?.writeSampleData(audioTrackIndex, encoder.getOutputBuffer(outputBufferIndex)!!, bufferInfo)
+                        muxer?.writeSampleData(audioTrackIndex, encoder.getOutputBuffer(outIdx)!!, bufferInfo)
                     }
                     sawEOS = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
-                    encoder.releaseOutputBuffer(outputBufferIndex, false)
+                    encoder.releaseOutputBuffer(outIdx, false)
                 }
             }
         }
@@ -422,213 +391,159 @@ class RecorderService : Service() {
         accumulatedPause += SystemClock.elapsedRealtime() - pausedAt
         pausedAt = 0L
         RecorderState.setResumed(accumulatedPause)
-        showNotification("Z Recorder", "Recording", chronometer = true, whenMillis = SystemClock.elapsedRealtime() - elapsedMillis())
+        showNotification("Z Recorder", "Recording", chronometer = true, whenMillis = SystemClock.elapsedRealtime())
     }
 
     private fun stopRecording(fromProjection: Boolean = false) {
-        Log.d("ZRecorder", "stopRecording")
         if (isStopping) return
         isStopping = true
         isCountingDown = false
         handler.removeCallbacks(countdownRunnable)
         isRunning.set(false)
 
-        try {
-            videoEncoder?.signalEndOfInputStream()
-            
-            val audioEosIndex = audioEncoder?.dequeueInputBuffer(10000)
-            if (audioEosIndex != null && audioEosIndex >= 0) {
-                audioEncoder?.queueInputBuffer(audioEosIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+        runCatching { videoEncoder?.signalEndOfInputStream() }
+        runCatching {
+            audioEncoder?.dequeueInputBuffer(10000)?.let { idx ->
+                if (idx >= 0) audioEncoder?.queueInputBuffer(idx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
             }
-        } catch (_: Exception) {}
+        }
 
         videoThread?.join(2000)
         audioThread?.join(2000)
 
-        if (isRecording) {
-            finalizeOutput()
-        } else {
-            runCatching { outputFd?.close() }
-            outputFd = null
-            outputUri = null
-        }
-
+        val wasRecording = isRecording
         isRecording = false
         isPaused = false
         RecorderState.setInactive()
         releaseAll()
-        mediaProjection?.let { 
-            runCatching { it.unregisterCallback(projectionCallback) }
-            if (!fromProjection) runCatching { it.stop() } 
-        }
+        mediaProjection?.let { runCatching { it.unregisterCallback(projectionCallback) }; if (!fromProjection) runCatching { it.stop() } }
         mediaProjection = null
         releaseWakeLock()
         stopForeground(STOP_FOREGROUND_REMOVE)
+
+        if (wasRecording) {
+            finalizeWithFFmpeg()
+        } else {
+            cleanupFailedOutput()
+            stopSelf()
+        }
         isStopping = false
-        stopSelf()
     }
 
-    private fun finalizeOutput() {
-        try {
-            if (muxerStarted) muxer?.stop()
-        } catch (_: Exception) {}
+    /** Pass 2: re-encode temp file with EXACT settings, then publish to gallery. */
+    private fun finalizeWithFFmpeg() {
+        runCatching { if (muxerStarted) muxer?.stop() }
         runCatching { muxer?.release() }
         runCatching { outputFd?.close() }
-        
         outputFd = null
-        
-        // Start FFmpeg processing in background
+        muxer = null
+
+        showNotification("Z Recorder", "Processing video (FFmpeg)...")
+
         serviceScope.launch {
-            isProcessing = true
-            showNotification("Z Recorder", "Processing video with FFmpeg...")
-            
             val temp = tempFile
             val uri = outputUri
-            
-            if (temp != null && temp.exists() && uri != null && ffmpegProcessor != null) {
-                try {
-                    val videoCodec = if (videoEncoderName == "H.265") "libx265" else "libx264"
-                    
-                    val config = FFmpegProcessor.EncodeConfig(
+
+            if (temp != null && temp.exists() && temp.length() > 0 && uri != null) {
+                val finalFile = File(cacheDir, "zrec_final_${System.currentTimeMillis()}.mp4")
+                val ok = FFmpegProcessor.encode(
+                    FFmpegProcessor.EncodeConfig(
                         inputPath = temp.absolutePath,
-                        outputPath = temp.absolutePath.replace(".mp4", "_final.mp4"),
-                        videoCodec = videoCodec,
-                        videoBitrate = videoBitrate / 1000, // Convert to kbps
-                        audioCodec = "aac",
-                        audioBitrate = audioBitrate / 1000,
+                        outputPath = finalFile.absolutePath,
+                        videoCodec = if (videoEncoderName == "H.265") "libx265" else "libx264",
+                        videoBitrateKbps = (videoBitrate / 1000).coerceAtLeast(1000),
+                        audioBitrateKbps = (audioBitrate / 1000).coerceAtLeast(64),
                         fps = fps,
                         width = outWidth,
-                        height = outHeight,
-                        preset = "medium"
+                        height = outHeight
                     )
-                    
-                    val success = ffmpegProcessor!!.encode(config)
-                    
-                    if (success) {
-                        // Copy final file to MediaStore
-                        val finalFile = File(config.outputPath)
-                        if (finalFile.exists()) {
-                            contentResolver.openOutputStream(uri)?.use { out ->
-                                FileInputStream(finalFile).use { inp ->
-                                    inp.copyTo(out)
-                                }
-                            }
-                            finalFile.delete()
-                        }
+                )
+
+                val source = if (ok && finalFile.exists() && finalFile.length() > 0) finalFile else temp
+                Log.d("ZRecorder", "FFmpeg success=$ok, publishing ${source.name} (${source.length()} bytes)")
+
+                runCatching {
+                    contentResolver.openOutputStream(uri, "wt")?.use { out ->
+                        FileInputStream(source).use { it.copyTo(out) }
                     }
-                    
-                    temp.delete()
-                    
-                } catch (e: Exception) {
-                    Log.e("ZRecorder", "FFmpeg processing failed: ${e.message}", e)
-                    // Fallback: copy temp file as-is
-                    try {
-                        contentResolver.openOutputStream(uri)?.use { out ->
-                            FileInputStream(temp).use { inp ->
-                                inp.copyTo(out)
-                            }
-                        }
-                    } catch (e2: Exception) {
-                        Log.e("ZRecorder", "Fallback copy failed: ${e2.message}")
-                    }
-                    temp.delete()
                 }
+                runCatching { finalFile.delete() }
+                runCatching { temp.delete() }
+            } else {
+                runCatching { temp?.delete() }
             }
-            
-            // Finalize MediaStore entry
-            if (uri != null) { 
+
+            if (uri != null) {
                 val values = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
-                runCatching { contentResolver.update(uri, values, null, null) } 
+                runCatching { contentResolver.update(uri, values, null, null) }
             }
-            
-            isProcessing = false
-            outputUri = null
+
             tempFile = null
-            
-            stopSelf()
+            outputUri = null
+            if (!isRecording) stopSelf()
         }
     }
 
     private fun cleanupFailedOutput() {
-        tempFile?.delete()
+        runCatching { outputFd?.close() }
+        runCatching { tempFile?.delete() }
         outputUri?.let { runCatching { contentResolver.delete(it, null, null) } }
         outputFd = null; outputUri = null; tempFile = null
     }
 
-    private fun releaseAll() { 
+    private fun releaseAll() {
         runCatching { virtualDisplay?.release() }
         runCatching { videoEncoder?.stop(); videoEncoder?.release() }
         runCatching { audioEncoder?.stop(); audioEncoder?.release() }
         runCatching { audioRecord?.stop(); audioRecord?.release() }
         virtualDisplay = null; videoEncoder = null; audioEncoder = null; audioRecord = null
     }
-    
+
     private fun elapsedMillis(): Long = RecorderState.state.value.elapsed(SystemClock.elapsedRealtime())
-    
-    private fun acquireWakeLock() { 
-        if (wakeLock == null) { 
-            runCatching { 
-                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ZRecorder::Recording").apply { setReferenceCounted(false); acquire() } 
-            } 
-        } 
+
+    private fun acquireWakeLock() {
+        if (wakeLock == null) runCatching {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ZRecorder::Recording").apply {
+                setReferenceCounted(false); acquire()
+            }
+        }
     }
-    
+
     private fun releaseWakeLock() { runCatching { wakeLock?.release() }; wakeLock = null }
 
     private fun startForegroundWithNotification(title: String, text: String) {
         createChannel()
-        val notification = buildNotification(title, text, false, 0L)
-        ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        ServiceCompat.startForeground(this, NOTIFICATION_ID, buildNotification(title, text, false, 0L), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
     }
 
     private fun showNotification(title: String, text: String, chronometer: Boolean = false, whenMillis: Long = 0L) {
         createChannel()
-        val notification = buildNotification(title, text, chronometer, whenMillis)
-        try { NotificationManagerCompat.from(this).notify(NOTIFICATION_ID, notification) } catch (_: Exception) {}
+        try { NotificationManagerCompat.from(this).notify(NOTIFICATION_ID, buildNotification(title, text, chronometer, whenMillis)) } catch (_: Exception) {}
     }
 
     private fun buildNotification(title: String, text: String, chronometer: Boolean, whenMillis: Long): Notification {
-        val contentIntent = PendingIntent.getActivity(
-            this, 
-            REQ_CONTENT, 
-            Intent(this, MainActivity::class.java).apply { flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP }, 
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val stopIntent = PendingIntent.getService(
-            this, 
-            REQ_STOP, 
-            Intent(this, RecorderService::class.java).apply { action = ACTION_STOP }, 
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
+        val contentIntent = PendingIntent.getActivity(this, REQ_CONTENT,
+            Intent(this, MainActivity::class.java).apply { flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        val stopIntent = PendingIntent.getService(this, REQ_STOP,
+            Intent(this, RecorderService::class.java).apply { action = ACTION_STOP },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(title)
-            .setContentText(text)
-            .setOnlyAlertOnce(true)
-            .setOngoing(true)
-            .setSilent(true)
+            .setContentTitle(title).setContentText(text)
+            .setOnlyAlertOnce(true).setOngoing(true).setSilent(true)
             .setContentIntent(contentIntent)
-            
         if (chronometer) builder.setUsesChronometer(true).setWhen(whenMillis)
-        
         if (isRecording) {
             if (isPaused) {
-                val resumeIntent = PendingIntent.getService(
-                    this, 
-                    REQ_RESUME, 
-                    Intent(this, RecorderService::class.java).apply { action = ACTION_RESUME }, 
-                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                )
-                builder.addAction(android.R.drawable.ic_media_play, "Resume", resumeIntent)
+                builder.addAction(android.R.drawable.ic_media_play, "Resume", PendingIntent.getService(this, REQ_RESUME,
+                    Intent(this, RecorderService::class.java).apply { action = ACTION_RESUME },
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
             } else {
-                val pauseIntent = PendingIntent.getService(
-                    this, 
-                    REQ_PAUSE, 
-                    Intent(this, RecorderService::class.java).apply { action = ACTION_PAUSE }, 
-                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                )
-                builder.addAction(android.R.drawable.ic_media_pause, "Pause", pauseIntent)
+                builder.addAction(android.R.drawable.ic_media_pause, "Pause", PendingIntent.getService(this, REQ_PAUSE,
+                    Intent(this, RecorderService::class.java).apply { action = ACTION_PAUSE },
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
             }
         }
         builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stopIntent)
@@ -637,19 +552,13 @@ class RecorderService : Service() {
 
     private fun createChannel() {
         val manager = getSystemService(NotificationManager::class.java)
-        val channel = NotificationChannel(CHANNEL_ID, "Screen recording", NotificationManager.IMPORTANCE_LOW).apply { 
-            description = "Shows recording controls"
-            setShowBadge(false)
-            lockscreenVisibility = Notification.VISIBILITY_PUBLIC 
-        }
-        manager.createNotificationChannel(channel)
+        manager.createNotificationChannel(NotificationChannel(CHANNEL_ID, "Screen recording", NotificationManager.IMPORTANCE_LOW).apply {
+            description = "Shows recording controls"; setShowBadge(false)
+        })
     }
 
     private fun formatElapsed(ms: Long): String {
-        val totalSeconds = ms / 1000L
-        val hours = totalSeconds / 3600L
-        val minutes = (totalSeconds % 3600L) / 60L
-        val seconds = totalSeconds % 60L
-        return if (hours > 0) String.format(Locale.US, "%02d:%02d:%02d", hours, minutes, seconds) else String.format(Locale.US, "%02d:%02d", minutes, seconds)
+        val t = ms / 1000; val h = t / 3600; val m = (t % 3600) / 60; val s = t % 60
+        return if (h > 0) String.format(Locale.US, "%02d:%02d:%02d", h, m, s) else String.format(Locale.US, "%02d:%02d", m, s)
     }
 }

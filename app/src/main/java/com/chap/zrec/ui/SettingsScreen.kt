@@ -85,7 +85,7 @@ fun SettingsScreen(prefs: PrefsManager, onBack: () -> Unit) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text("Z Recorder", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                     Spacer(Modifier.height(8.dp))
-                    Text("Version: 1.0", style = MaterialTheme.typography.bodyLarge)
+                    Text("Version: pr-0.1", style = MaterialTheme.typography.bodyLarge)
                     Spacer(Modifier.height(4.dp))
                     Text("Author: chappcG", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
                     Spacer(Modifier.height(4.dp))

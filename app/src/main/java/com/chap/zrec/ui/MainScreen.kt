@@ -9,6 +9,7 @@ import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.media.MediaMetadataRetriever
 import android.media.MediaExtractor
+import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.SystemClock
@@ -176,7 +177,7 @@ fun MainScreen(prefs: PrefsManager, repository: RecordingRepository, onOpenSetti
                 title = {
                     Column {
                         Text("Z Recorder", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                        Text("Material You screen recorder", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("A powerful screen recorder", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 },
                 actions = {

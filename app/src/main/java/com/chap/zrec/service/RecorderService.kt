@@ -8,17 +8,11 @@ import android.app.Service
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
-import android.media.AudioFormat
-import android.media.AudioPlaybackCaptureConfiguration
-import android.media.AudioRecord
-import android.media.MediaCodec
-import android.media.MediaCodecInfo
-import android.media.MediaFormat
-import android.media.MediaMuxer
-import android.media.MediaRecorder
+import android.media.*
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
@@ -32,9 +26,12 @@ import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Log
+import android.view.Surface
+import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import com.chap.zrec.MainActivity
 import com.chap.zrec.R
 import java.io.IOException
@@ -222,7 +219,7 @@ class RecorderService : Service() {
             }
             outWidth = if (isPortrait) short else long
             outHeight = if (isPortrait) long else short
-            Log.d("ZRecorder", "Output size: ${outWidth}x${outHeight}, isPortrait=$isPortrait")
+            Log.d("ZRecorder", "Output size: ${outWidth}x${outHeight}, isPortrait=$isPortrait, fps=$fps, bitrate=$videoBitrate")
 
             createOutput()
             muxer = MediaMuxer(outputFd?.fileDescriptor ?: throw IOException("No fd"), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
@@ -232,12 +229,18 @@ class RecorderService : Service() {
             } else {
                 MediaFormat.MIMETYPE_VIDEO_AVC
             }
+            
             val videoFormat = MediaFormat.createVideoFormat(mimeType, outWidth, outHeight).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
                 setInteger(MediaFormat.KEY_BIT_RATE, videoBitrate)
                 setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, fps) // Keyframe every second
+                setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+                setInteger(MediaFormat.KEY_PROFILE, if (mimeType == MediaFormat.MIMETYPE_VIDEO_HEVC) 
+                    MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10 else 
+                    MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
             }
+            
             videoEncoder = MediaCodec.createEncoderByType(mimeType).apply {
                 configure(videoFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             }
@@ -268,6 +271,7 @@ class RecorderService : Service() {
 
                     val audioMediaFormat = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, 1).apply {
                         setInteger(MediaFormat.KEY_BIT_RATE, audioBitrate)
+                        setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
                     }
                     audioEncoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC).apply {
                         configure(audioMediaFormat, null, null, 0)
@@ -332,9 +336,11 @@ class RecorderService : Service() {
             if (status >= 0) {
                 if (!muxerStarted) {
                     videoTrackIndex = muxer!!.addTrack(videoEncoder!!.getOutputFormat(status))
+                    Log.d("ZRecorder", "Video track added: ${videoEncoder!!.getOutputFormat(status)}")
                     if (audioEncoder == null) {
                         muxer!!.start()
                         muxerStarted = true
+                        Log.d("ZRecorder", "Muxer started (video only)")
                     }
                 }
                 if (muxerStarted && bufferInfo.size > 0) {
@@ -369,9 +375,11 @@ class RecorderService : Service() {
                 if (outputBufferIndex >= 0) {
                     if (!muxerStarted) {
                         audioTrackIndex = muxer!!.addTrack(encoder.getOutputFormat(outputBufferIndex))
+                        Log.d("ZRecorder", "Audio track added: ${encoder.getOutputFormat(outputBufferIndex)}")
                         if (videoTrackIndex >= 0) {
                             muxer!!.start()
                             muxerStarted = true
+                            Log.d("ZRecorder", "Muxer started (video + audio)")
                         }
                     }
                     if (muxerStarted && bufferInfo.size > 0) {

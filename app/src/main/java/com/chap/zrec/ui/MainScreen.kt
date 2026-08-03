@@ -331,7 +331,8 @@ private fun buildPropertyRows(item: RecordingItem, json: org.json.JSONObject?): 
     rows += Triple("", "File size", formatSize(item.size))
 
     if (json == null) {
-        rows += Triple("", "Resolution", "${'$'}{item.width}x${'$'}{item.height}")
+        val res = "${item.width}x${item.height}"
+        rows += Triple("", "Resolution", res)
         rows += Triple("", "Duration", formatDuration(item.duration))
         rows += Triple("", "Note", "Probe unavailable")
         return rows
@@ -351,15 +352,18 @@ private fun buildPropertyRows(item: RecordingItem, json: org.json.JSONObject?): 
 
     format?.let { f ->
         rows += Triple("", "Format", (f.optString("format_long_name", f.optString("format_name", "MP4"))))
-        rows += Triple("", "Duration", formatDuration((f.optDouble("duration", 0.0) * 1000).toLong()))
+        val dur = (f.optDouble("duration", 0.0) * 1000).toLong()
+        rows += Triple("", "Duration", formatDuration(dur))
         rows += Triple("", "Overall bit rate", bitrateText(f.optLong("bit_rate", 0)))
     }
 
     video?.let { v ->
         rows += Triple("Video", "", "")
         rows += Triple("", "Codec", codecLabel(v.optString("codec_name", "")))
-        rows += Triple("", "Width", "${'$'}{v.optInt("width")} pixels")
-        rows += Triple("", "Height", "${'$'}{v.optInt("height")} pixels")
+        val w = v.optInt("width")
+        val h = v.optInt("height")
+        val res = "$w x $h"
+        rows += Triple("", "Resolution", res)
         rows += Triple("", "Frame rate", fpsText(v.optString("avg_frame_rate", v.optString("r_frame_rate", ""))))
         rows += Triple("", "Bit rate", bitrateText(v.optLong("bit_rate", 0)))
     }
@@ -367,7 +371,9 @@ private fun buildPropertyRows(item: RecordingItem, json: org.json.JSONObject?): 
     audio?.let { a ->
         rows += Triple("Audio", "", "")
         rows += Triple("", "Codec", a.optString("codec_name", "aac").uppercase())
-        rows += Triple("", "Sampling rate", "${'$'}{a.optString("sample_rate", "?")} Hz")
+        val sr = a.optString("sample_rate", "?")
+        val srText = "$sr Hz"
+        rows += Triple("", "Sampling rate", srText)
         rows += Triple("", "Channel(s)", a.optString("channels", "?"))
         rows += Triple("", "Bit rate", bitrateText(a.optLong("bit_rate", 0)))
     }

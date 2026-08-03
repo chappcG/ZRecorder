@@ -73,7 +73,8 @@ dependencies {
     implementation("io.coil-kt:coil-video:2.7.0")
     
     // FFmpeg for accurate encoding
-    implementation("dev.ffmpegkit-maintained:ffmpeg-kit-full:8.1.7")
+    implementation("dev.ffmpegkit-maintained:ffmpeg-kit-full-gpl:8.1.7")
+    implementation("com.arthenica:smart-exception-java:0.2.1")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

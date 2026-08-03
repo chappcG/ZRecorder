@@ -13,10 +13,12 @@ object FFmpegProcessor {
 
     private const val TAG = "FFmpegProcessor"
 
+    enum class EncodeResult { SUCCESS, CANCELLED, FAILED }
+
     data class EncodeConfig(
         val inputPath: String,
         val outputPath: String,
-        val videoCodec: String,      // "libx264" or "libx265"
+        val videoCodec: String,
         val videoBitrateKbps: Int,
         val audioBitrateKbps: Int,
         val fps: Int,
@@ -24,9 +26,12 @@ object FFmpegProcessor {
         val height: Int
     )
 
-    /** Re-encode with EXACT bitrate + constant frame rate. */
-    suspend fun encode(config: EncodeConfig): Boolean = withContext(Dispatchers.IO) {
-        val deferred = CompletableDeferred<Boolean>()
+    suspend fun encode(
+        config: EncodeConfig,
+        durationMs: Long,
+        onProgress: (Int) -> Unit
+    ): EncodeResult = withContext(Dispatchers.IO) {
+        val deferred = CompletableDeferred<EncodeResult>()
 
         val cmd = buildString {
             append("-y -i \"").append(config.inputPath).append("\" ")
@@ -40,23 +45,41 @@ object FFmpegProcessor {
             append("-s ").append(config.width).append("x").append(config.height).append(" ")
             append("-c:a aac ")
             append("-b:a ").append(config.audioBitrateKbps).append("k ")
-            append("-ar 44100 -ac 1 ")
             append("-movflags +faststart ")
             append("\"").append(config.outputPath).append("\"")
         }
 
         Log.d(TAG, "FFmpeg cmd: $cmd")
 
-        FFmpegKit.executeAsync(cmd) { session ->
-            val ok = ReturnCode.isSuccess(session.returnCode)
-            if (!ok) Log.e(TAG, "FFmpeg failed: ${session.output}")
-            deferred.complete(ok)
-        }
+        FFmpegKit.executeAsync(
+            cmd,
+            { session ->
+                deferred.complete(when {
+                    ReturnCode.isSuccess(session.returnCode) -> EncodeResult.SUCCESS
+                    ReturnCode.isCancel(session.returnCode) -> EncodeResult.CANCELLED
+                    else -> {
+                        Log.e(TAG, "FFmpeg failed: ${session.output}")
+                        EncodeResult.FAILED
+                    }
+                })
+            },
+            { log -> Log.d(TAG, "ffmpeg: ${log.message}") },
+            { stats ->
+                if (durationMs > 0) {
+                    val p = ((stats.time * 100) / durationMs).toInt().coerceIn(0, 99)
+                    onProgress(p)
+                }
+            }
+        )
 
         deferred.await()
     }
 
-    /** Read REAL file properties with FFprobe (returns raw JSON). */
+    fun cancel() {
+        Log.d(TAG, "Cancelling FFmpeg session")
+        FFmpegKit.cancel()
+    }
+
     suspend fun probe(path: String): JSONObject? = withContext(Dispatchers.IO) {
         val sb = StringBuilder()
         val deferred = CompletableDeferred<Boolean>()

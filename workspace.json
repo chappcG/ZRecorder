@@ -215,6 +215,11 @@
         },
         {
           "type": "library",
+          "name": "transformed:ffmpeg-kit-full-8.1.7:jars:classes",
+          "scope": "compile"
+        },
+        {
+          "type": "library",
           "name": "org.jetbrains.kotlin:kotlin-stdlib:2.1.21",
           "scope": "compile"
         },
@@ -712,6 +717,11 @@
         {
           "type": "library",
           "name": "transformed:navigation-runtime-2.8.4:jars:classes",
+          "scope": "compile"
+        },
+        {
+          "type": "library",
+          "name": "transformed:ffmpeg-kit-full-8.1.7:jars:classes",
           "scope": "compile"
         },
         {
@@ -1359,6 +1369,16 @@
       "roots": [
         {
           "path": "/home/.gradle/caches/8.14.3/transforms/91d62f3abad316a0853e85f6547628d9/transformed/navigation-runtime-2.8.4/jars/classes.jar",
+          "type": "CLASSES"
+        }
+      ]
+    },
+    {
+      "name": "transformed:ffmpeg-kit-full-8.1.7:jars:classes",
+      "type": "COMPILE",
+      "roots": [
+        {
+          "path": "/home/.gradle/caches/8.14.3/transforms/ac77e85c946bffc5b6d4a2a7fe1333f9/transformed/ffmpeg-kit-full-8.1.7/jars/classes.jar",
           "type": "CLASSES"
         }
       ]

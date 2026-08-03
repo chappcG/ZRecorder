@@ -16,6 +16,7 @@ import com.chap.zrec.data.PrefsManager
 import com.chap.zrec.data.RecorderSettings
 import com.chap.zrec.data.RecordingRepository
 import com.chap.zrec.service.MediaProjectionCache
+import com.chap.zrec.service.ProcessingState
 import com.chap.zrec.service.RecorderService
 import com.chap.zrec.ui.MainScreen
 import com.chap.zrec.ui.SettingsScreen
@@ -26,6 +27,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         Log.d("ZRecorder", "MainActivity onCreate")
         enableEdgeToEdge()
+        if (intent?.getBooleanExtra("show_processing", false) == true) ProcessingState.show()
         val prefs = PrefsManager(applicationContext)
         val repository = RecordingRepository(applicationContext)
         setContent {
@@ -37,6 +39,10 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        if (intent.getBooleanExtra("show_processing", false)) ProcessingState.show()
     }
 }
 

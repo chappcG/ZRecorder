@@ -97,6 +97,8 @@ import com.chap.zrec.data.RecordingRepository
 import android.provider.MediaStore
 import com.chap.zrec.service.FFmpegProcessor
 import com.chap.zrec.data.UpdateChecker
+import androidx.compose.material3.LinearProgressIndicator
+import com.chap.zrec.service.ProcessingState
 import com.chap.zrec.service.RecorderService
 import com.chap.zrec.service.RecorderState
 import com.chap.zrec.startRecorderService
@@ -241,6 +243,16 @@ fun MainScreen(prefs: PrefsManager, repository: RecordingRepository, onOpenSetti
         PropertiesDialog(item = item, onDismiss = { propertiesItem = null })
     }
 
+    val processing by ProcessingState.state.collectAsState()
+    if (processing.active && !processing.minimized) {
+        ProcessingDialog(
+            fileName = processing.fileName,
+            progress = processing.progress,
+            onCancel = { sendAction(context, RecorderService.ACTION_CANCEL_PROCESSING) },
+            onMinimize = { sendAction(context, RecorderService.ACTION_MINIMIZE) }
+        )
+    }
+
     val currentUpdateInfo = updateInfo
     if (showUpdateDialog && currentUpdateInfo != null) {
         AlertDialog(
@@ -351,7 +363,8 @@ private fun buildPropertyRows(item: RecordingItem, json: org.json.JSONObject?): 
     }
 
     format?.let { f ->
-        rows += Triple("", "Format", (f.optString("format_long_name", f.optString("format_name", "MP4"))))
+        val fName = f.optString("format_name", "mp4")
+        rows += Triple("", "Format", if (fName.contains("mp4")) "MP4 (MPEG-4)" else fName.uppercase())
         val dur = (f.optDouble("duration", 0.0) * 1000).toLong()
         rows += Triple("", "Duration", formatDuration(dur))
         rows += Triple("", "Overall bit rate", bitrateText(f.optLong("bit_rate", 0)))
@@ -388,18 +401,27 @@ private fun codecLabel(name: String): String = when (name) {
 
 private fun fpsText(frac: String): String {
     if (frac.isBlank()) return "Unknown"
-    return if (frac.contains("/")) {
-        val p = frac.split("/")
-        val n = p[0].toDoubleOrNull() ?: return "Unknown"
-        val d = p.getOrNull(1)?.toDoubleOrNull() ?: 0.0
-        if (d > 0) "${'$'}{(n / d).toInt()} fps" else "Unknown"
-    } else "${'$'}{frac.toDoubleOrNull()?.toInt() ?: 0} fps"
+    if (frac.contains("/")) {
+        val parts = frac.split("/")
+        val n = parts[0].toDoubleOrNull() ?: return "Unknown"
+        val d = parts.getOrNull(1)?.toDoubleOrNull() ?: 0.0
+        if (d <= 0.0) return "Unknown"
+        val value = (n / d).toInt()
+        return "$value fps"
+    }
+    val value = frac.toDoubleOrNull()?.toInt() ?: 0
+    return "$value fps"
 }
 
-private fun bitrateText(bits: Long): String = when {
-    bits <= 0 -> "Unknown"
-    bits >= 1_000_000 -> String.format(java.util.Locale.US, "%.2f Mb/s", bits / 1_000_000.0)
-    else -> "${'$'}{bits / 1000} kb/s"
+private fun bitrateText(bits: Long): String {
+    if (bits <= 0) return "Unknown"
+    return if (bits >= 1_000_000) {
+        val mbps = bits / 1_000_000.0
+        String.format(java.util.Locale.US, "%.2f Mb/s", mbps)
+    } else {
+        val kbps = bits / 1000
+        "$kbps kb/s"
+    }
 }
 
 @Composable
@@ -474,3 +496,55 @@ private fun sendAction(context: Context, action: String) { context.startService(
 private fun openVideo(context: Context, uri: Uri) { try { context.startActivity(Intent(Intent.ACTION_VIEW).apply { setDataAndType(uri, "video/mp4"); addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION) }) } catch (e: ActivityNotFoundException) { Toast.makeText(context, "No player found", Toast.LENGTH_SHORT).show() } catch (e: Exception) { Toast.makeText(context, "Cannot open video", Toast.LENGTH_SHORT).show() } }
 private fun formatDuration(ms: Long): String { val totalSeconds = ms / 1000L; val hours = totalSeconds / 3600L; val minutes = (totalSeconds % 3600L) / 60L; val seconds = totalSeconds % 60L; return if (hours > 0) String.format(Locale.US, "%02d:%02d:%02d", hours, minutes, seconds) else String.format(Locale.US, "%02d:%02d", minutes, seconds) }
 private fun formatSize(bytes: Long): String = when { bytes >= 1_073_741_824 -> String.format(Locale.US, "%.2f GB", bytes / 1_073_741_824.0); bytes >= 1_048_576 -> String.format(Locale.US, "%.1f MB", bytes / 1_048_576.0); bytes >= 1024 -> String.format(Locale.US, "%.1f KB", bytes / 1024.0); else -> "$bytes B" }
+
+@Composable
+private fun ProcessingDialog(
+    fileName: String,
+    progress: Int,
+    onCancel: () -> Unit,
+    onMinimize: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onMinimize,
+        title = { Text("Processing video", fontWeight = FontWeight.Bold) },
+        text = {
+            Column {
+                Text(
+                    fileName,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1
+                )
+                Spacer(Modifier.height(16.dp))
+                LinearProgressIndicator(
+                    progress = progress / 100f,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        "Re-encoding with FFmpeg",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        "$progress%",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onCancel) {
+                Text("Cancel", color = MaterialTheme.colorScheme.error)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onMinimize) { Text("Minimize") }
+        }
+    )
+}

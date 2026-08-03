@@ -8,7 +8,6 @@ import android.app.Service
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
@@ -29,11 +28,11 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ServiceCompat
-import androidx.core.content.ContextCompat
 import com.chap.zrec.MainActivity
 import com.chap.zrec.R
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import java.io.File
@@ -51,6 +50,9 @@ class RecorderService : Service() {
         const val ACTION_PAUSE = "com.chap.zrec.action.PAUSE"
         const val ACTION_RESUME = "com.chap.zrec.action.RESUME"
         const val ACTION_STOP = "com.chap.zrec.action.STOP"
+        const val ACTION_CANCEL_PROCESSING = "com.chap.zrec.action.CANCEL_PROCESSING"
+        const val ACTION_MINIMIZE = "com.chap.zrec.action.MINIMIZE"
+        const val ACTION_SHOW_PROCESSING = "com.chap.zrec.action.SHOW_PROCESSING"
 
         const val EXTRA_WIDTH = "extra_width"
         const val EXTRA_HEIGHT = "extra_height"
@@ -66,10 +68,13 @@ class RecorderService : Service() {
 
         private const val CHANNEL_ID = "zrec_recording_channel"
         private const val NOTIFICATION_ID = 2001
+        private const val PROCESSING_NOTIFICATION_ID = 2002
         private const val REQ_CONTENT = 100
         private const val REQ_STOP = 101
         private const val REQ_PAUSE = 102
         private const val REQ_RESUME = 103
+        private const val REQ_CANCEL = 104
+        private const val REQ_SHOW = 105
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -94,6 +99,8 @@ class RecorderService : Service() {
     private var startedAt = 0L
     private var pausedAt = 0L
     private var accumulatedPause = 0L
+    private var recordedDurationMs = 0L
+    private var currentDisplayName = ""
 
     private var resultCode = 0
     private var resultData: Intent? = null
@@ -193,6 +200,9 @@ class RecorderService : Service() {
             ACTION_PAUSE -> pauseRecording()
             ACTION_RESUME -> resumeRecording()
             ACTION_STOP -> stopRecording()
+            ACTION_CANCEL_PROCESSING -> FFmpegProcessor.cancel()
+            ACTION_MINIMIZE -> ProcessingState.minimize()
+            ACTION_SHOW_PROCESSING -> ProcessingState.show()
             else -> if (!isRecording && !isCountingDown) stopSelf()
         }
         return START_NOT_STICKY
@@ -218,7 +228,6 @@ class RecorderService : Service() {
             outWidth = if (isPortrait) short else long
             outHeight = if (isPortrait) long else short
 
-            // FIX: Record to TEMP file first. FFmpeg will produce the final file.
             tempFile = File(cacheDir, "zrec_temp_${System.currentTimeMillis()}.mp4")
             outputFd = ParcelFileDescriptor.open(
                 tempFile!!,
@@ -229,8 +238,9 @@ class RecorderService : Service() {
 
             val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
             val safePrefix = filePrefix.trim().ifEmpty { "ZREC" }.replace(Regex("[^A-Za-z0-9_-]"), "_")
+            currentDisplayName = "${safePrefix}_$timestamp.mp4"
             val values = ContentValues().apply {
-                put(MediaStore.Video.Media.DISPLAY_NAME, "${safePrefix}_$timestamp.mp4")
+                put(MediaStore.Video.Media.DISPLAY_NAME, currentDisplayName)
                 put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
                 put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MOVIES}/ZRecorder")
                 put(MediaStore.Video.Media.IS_PENDING, 1)
@@ -245,7 +255,7 @@ class RecorderService : Service() {
 
             val videoFormat = MediaFormat.createVideoFormat(mimeType, outWidth, outHeight).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-                setInteger(MediaFormat.KEY_BIT_RATE, maxOf(videoBitrate, 20_000_000)) // high quality first pass
+                setInteger(MediaFormat.KEY_BIT_RATE, maxOf(videoBitrate, 20_000_000))
                 setInteger(MediaFormat.KEY_FRAME_RATE, fps)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             }
@@ -256,7 +266,7 @@ class RecorderService : Service() {
 
             if (audioMode != "None") {
                 try {
-                    val sampleRate = 44100
+                    val sampleRate = 48000
                     val channelConfig = AudioFormat.CHANNEL_IN_MONO
                     val audioFormat = AudioFormat.ENCODING_PCM_16BIT
                     audioBufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat).coerceAtLeast(4096)
@@ -412,6 +422,7 @@ class RecorderService : Service() {
         audioThread?.join(2000)
 
         val wasRecording = isRecording
+        recordedDurationMs = elapsedMillis()
         isRecording = false
         isPaused = false
         RecorderState.setInactive()
@@ -430,7 +441,6 @@ class RecorderService : Service() {
         isStopping = false
     }
 
-    /** Pass 2: re-encode temp file with EXACT settings, then publish to gallery. */
     private fun finalizeWithFFmpeg() {
         runCatching { if (muxerStarted) muxer?.stop() }
         runCatching { muxer?.release() }
@@ -438,15 +448,22 @@ class RecorderService : Service() {
         outputFd = null
         muxer = null
 
-        showNotification("Z Recorder", "Processing video (FFmpeg)...")
+        ProcessingState.start(currentDisplayName)
 
         serviceScope.launch {
+            val collector: Job = launch {
+                ProcessingState.state.collect { st ->
+                    if (st.active && st.minimized) showProcessingNotification(st.progress)
+                }
+            }
+
             val temp = tempFile
             val uri = outputUri
+            var cancelled = false
 
             if (temp != null && temp.exists() && temp.length() > 0 && uri != null) {
                 val finalFile = File(cacheDir, "zrec_final_${System.currentTimeMillis()}.mp4")
-                val ok = FFmpegProcessor.encode(
+                val result = FFmpegProcessor.encode(
                     FFmpegProcessor.EncodeConfig(
                         inputPath = temp.absolutePath,
                         outputPath = finalFile.absolutePath,
@@ -456,12 +473,14 @@ class RecorderService : Service() {
                         fps = fps,
                         width = outWidth,
                         height = outHeight
-                    )
-                )
+                    ),
+                    recordedDurationMs
+                ) { p -> ProcessingState.progress(p) }
 
-                val source = if (ok && finalFile.exists() && finalFile.length() > 0) finalFile else temp
-                Log.d("ZRecorder", "FFmpeg success=$ok, publishing ${source.name} (${source.length()} bytes)")
+                cancelled = result == FFmpegProcessor.EncodeResult.CANCELLED
+                Log.d("ZRecorder", "FFmpeg result=$result")
 
+                val source = if (result == FFmpegProcessor.EncodeResult.SUCCESS && finalFile.exists() && finalFile.length() > 0) finalFile else temp
                 runCatching {
                     contentResolver.openOutputStream(uri, "wt")?.use { out ->
                         FileInputStream(source).use { it.copyTo(out) }
@@ -478,10 +497,76 @@ class RecorderService : Service() {
                 runCatching { contentResolver.update(uri, values, null, null) }
             }
 
+            collector.cancel()
+            val wasMinimized = ProcessingState.state.value.minimized
+            ProcessingState.finish()
+            cancelProcessingNotification()
+
+            if (wasMinimized) {
+                postResultNotification(
+                    when {
+                        cancelled -> "Processing cancelled - original video saved"
+                        else -> "Video saved to Movies/ZRecorder"
+                    }
+                )
+            }
+
             tempFile = null
             outputUri = null
             if (!isRecording) stopSelf()
         }
+    }
+
+    private fun showProcessingNotification(progress: Int) {
+        createChannel()
+        val cancelIntent = PendingIntent.getService(
+            this, REQ_CANCEL,
+            Intent(this, RecorderService::class.java).apply { action = ACTION_CANCEL_PROCESSING },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val showIntent = PendingIntent.getActivity(
+            this, REQ_SHOW,
+            Intent(this, MainActivity::class.java).apply {
+                putExtra("show_processing", true)
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val n = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle("Processing video")
+            .setContentText("$progress% - re-encoding with FFmpeg")
+            .setProgress(100, progress, false)
+            .setOnlyAlertOnce(true)
+            .setOngoing(true)
+            .setSilent(true)
+            .setContentIntent(showIntent)
+            .addAction(android.R.drawable.ic_menu_view, "Show", showIntent)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Cancel", cancelIntent)
+            .build()
+        try { NotificationManagerCompat.from(this).notify(PROCESSING_NOTIFICATION_ID, n) } catch (_: Exception) {}
+    }
+
+    private fun cancelProcessingNotification() {
+        try { NotificationManagerCompat.from(this).cancel(PROCESSING_NOTIFICATION_ID) } catch (_: Exception) {}
+    }
+
+    private fun postResultNotification(text: String) {
+        createChannel()
+        val contentIntent = PendingIntent.getActivity(
+            this, REQ_CONTENT,
+            Intent(this, MainActivity::class.java).apply { flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val n = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle("Z Recorder")
+            .setContentText(text)
+            .setAutoCancel(true)
+            .setOnlyAlertOnce(true)
+            .setContentIntent(contentIntent)
+            .build()
+        try { NotificationManagerCompat.from(this).notify(PROCESSING_NOTIFICATION_ID, n) } catch (_: Exception) {}
     }
 
     private fun cleanupFailedOutput() {

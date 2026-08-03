@@ -1,3 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="app/src/main/java/com/chap/zrec"
+
+if [ ! -d "$APP_DIR" ]; then
+    echo "ERROR: Run this from the ZRecorder project root."
+    exit 1
+fi
+
+echo "Updating subtitle, dynamic version, and reworking Settings UI..."
+
+###############################################################################
+# 1. Update MainScreen.kt subtitle
+###############################################################################
+sed -i 's/Material You screen recorder/A powerful screen recorder/g' "$APP_DIR/ui/MainScreen.kt"
+
+###############################################################################
+# 2. Rework SettingsScreen.kt with beautiful Material 3 UI + Dynamic Version
+###############################################################################
+cat > "$APP_DIR/ui/SettingsScreen.kt" <<'EOF'
 package com.chap.zrec.ui
 
 import android.content.Intent
@@ -341,3 +362,11 @@ private fun BitrateInputDialog(current: Float, onSave: (Float) -> Unit, onDismis
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
     )
 }
+EOF
+
+echo "Done!"
+echo "1. Subtitle updated to 'A powerful screen recorder'."
+echo "2. Settings screen now uses beautiful Material 3 cards with better spacing and typography."
+echo "3. Version name is now fetched dynamically from the app's package info."
+echo ""
+echo "Rebuild in AndroidIDE!"
